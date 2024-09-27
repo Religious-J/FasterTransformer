@@ -131,6 +131,8 @@ void BaseBeamSearchLayer<T>::setup(const size_t batch_size, const size_t beam_wi
     // do nothing.
 }
 
+
+// HERE ?? beam_search =>
 template<typename T>
 void BaseBeamSearchLayer<T>::forward(std::vector<Tensor>* output_tensors, const std::vector<Tensor>* input_tensors)
 {
@@ -151,6 +153,7 @@ void BaseBeamSearchLayer<T>::forward(std::vector<Tensor>* output_tensors, const 
     //      sequence_length [local_batch_size * beam_width]
     //      tgt_cache_indirection [local_batch_size, beam_width, max_seq_len]
 
+    // use unordered_map 来实现
     std::unordered_map<std::string, Tensor> input_tensors_map{{"logits", input_tensors->at(0)},
                                                               {"embedding_bias", input_tensors->at(1)},
                                                               {"step", input_tensors->at(2)},
@@ -177,6 +180,8 @@ void BaseBeamSearchLayer<T>::forward(std::unordered_map<std::string, Tensor>*   
     forward(&output_map, &input_map);
 }
 
+
+// HERE is beam_search REAL??
 template<typename T>
 void BaseBeamSearchLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_tensors)
 {
@@ -234,6 +239,7 @@ void BaseBeamSearchLayer<T>::forward(TensorMap* output_tensors, TensorMap* input
                                       input_tensors->getVal<float>("presence_penalty");
     }
 
+    // 这个函数处理 logits 的偏置和惩罚的应用，生成解码所需的输出
     invokeAddBiasApplyPenalties(
         step,
         input_tensors->at("logits").getPtr<T>(),
@@ -259,11 +265,13 @@ void BaseBeamSearchLayer<T>::forward(TensorMap* output_tensors, TensorMap* input
         stream_);
     sync_check_cuda_error();
 
+    // 对 logits 执行 SoftMax 操作，生成概率分布，便于后续的采样或选择
     invokeSoftMax(output_tensors, input_tensors);
 
     if (beam_width > 1) {
         const int max_seq_len = output_tensors->at("output_ids").shape[0];
 
+        // 更新目标缓存，以支持束搜索过程中对各束的状态进行有效管理
         update_indir_cache_kernelLauncher(
             output_tensors->at("tgt_cache_indirection").getPtr<int>(),
             input_tensors->at("src_cache_indirection").getPtr<const int>(),

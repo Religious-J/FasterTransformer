@@ -199,6 +199,7 @@ void invokeAddBiasApplyPenalties(int                         step,
         dim3 block(512);
         if (std::is_same<T, half>::value && vocab_size % 2 == 0 && vocab_size_padded % 2 == 0) {
             dim3 grid((vocab_size_padded / 2 + block.x - 1) / block.x, beam_width * local_batch_size);
+            // add_bias_temperature：负责将偏置和温度应用到 logits
             add_bias_temperature<<<grid, block, 0, stream>>>(reinterpret_cast<half2*>(logits),
                                                              reinterpret_cast<const half2*>(bias),
                                                              batch_size,
@@ -219,6 +220,7 @@ void invokeAddBiasApplyPenalties(int                         step,
             size_t smem_size = (sizeof(T) * step + 31) / 32 * 32 + sizeof(int) * step;
             dim3   block(256);
             dim3   grid(beam_width * local_batch_size);
+            // apply_repetition_penalty：负责对 logits 应用重复惩罚，依据不同的惩罚方式（乘法或加法）进行调整
             if (repetition_penalty_type == RepetitionPenaltyType::Multiplicative) {
                 apply_repetition_penalty<T, false>
                     <<<grid, block, smem_size, stream>>>(logits,
@@ -261,6 +263,7 @@ void invokeAddBiasApplyPenalties(int                         step,
 
         const int block_size = min(local_batch_size * beam_width, 1024);
         const int grid_size  = (local_batch_size * beam_width + block_size - 1) / block_size;
+        // apply_min_length_penalty：确保生成的序列满足最小长度要求
         apply_min_length_penalty<<<grid_size, block_size, 0, stream>>>(
             logits, min_length, end_ids, sequence_lengths, max_input_length, beam_width, vocab_size_padded);
     }
