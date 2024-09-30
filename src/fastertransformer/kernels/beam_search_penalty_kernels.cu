@@ -85,6 +85,144 @@ __global__ void add_bias_temperature(half2*       logits,
     }
 }
 
+/*
+    float logits[10] = {0.2, 0.8, 0.3, 0.1, 0.5, 0.9, 0.4, 0.7, 0.6, 0.05};  // logits 数组
+    int current_ids[1] = {2};                                                // 当前步骤生成的 token ID
+    int previous_ids[3] = {1, 3, 4};                                         // 之前步骤的 token ID
+    int input_lengths[1] = {3};                                              // 输入长度
+    int step = 3;                                                            // 当前生成步骤
+    int max_input_length = 5;                                                // 最大输入长度
+    float repetition_penalty = 1.5;                                          // 惩罚系数
+    int is_additive = 1;                                                     // 使用加法惩罚
+*/
+
+// 对之前所有的词做惩罚 ？？ 对之前出现的所有词 -？
+// C 函数版本的 apply_repetition_penalty + batch_size=1 beam_width=1
+void apply_repetition_penalty(float* logits,
+                              int vocab_size_padded,
+                              int step,                     // 当前生成步骤
+                              const int* current_ids,       //  当前步骤生成的 token ID
+                              const int* previous_ids,      // 之前步骤的 token ID
+                              const int* input_lengths,     // 输入长度
+                              int max_input_length,         // 最大输入长度
+                              float repetition_penalty,     // 惩罚系数
+                              int is_additive               // 使用加法惩罚?
+                              )
+{
+    assert(step > 0);
+
+    // 当前 ID 和长度
+    int prev_id = current_ids[0];
+    int input_length = (input_lengths != NULL) ? input_lengths[0] : max_input_length;
+
+    // 创建局部数组用于存储调整后的 logits 和对应的索引
+    float penalty_logits[step];
+    int penalty_indices[step];   // 惩罚指标
+
+    // 初始化
+    penalty_indices[step - 1] = prev_id;
+    float prev_logit = logits[prev_id];
+    if (is_additive) {
+        penalty_logits[step - 1] = prev_logit - repetition_penalty;
+    } else {
+        penalty_logits[step - 1] = (prev_logit > 0) ? prev_logit / repetition_penalty : prev_logit * repetition_penalty;
+    }
+
+    // 处理历史步骤
+    if (step > 1) {
+        for (int i = step - 2; i >= 0; --i) {
+            // 跳过填充的 token
+            if (i >= input_length && i < max_input_length) {
+                continue;
+            }
+
+            // 获取之前的 ID 和 logit
+            prev_id = previous_ids[i];
+            prev_logit = logits[prev_id];
+
+            penalty_indices[i] = prev_id;    // 用这样记录，感觉最后用 previous_ids 反向遍历感觉也可以 
+            if (is_additive) {
+                penalty_logits[i] = prev_logit - repetition_penalty;
+            } else {
+                penalty_logits[i] = (prev_logit > 0) ? prev_logit / repetition_penalty : prev_logit * repetition_penalty;
+            }
+        }
+    }
+
+    // 写回到 logits
+    for (int i = 0; i < step; i++) {
+        if (i >= input_length && i < max_input_length) {
+            continue;
+        }
+        logits[penalty_indices[i]] = penalty_logits[i];
+    }
+}
+
+
+// CPU
+void apply_repetition_penalty_CPU(float* logits,
+                              const int batch_size,
+                              const int beam_width,
+                              const int vocab_size,
+                              const int vocab_size_padded,
+                              const int step,
+                              const int* current_ids,
+                              const int* previous_ids,
+                              const int* parent_ids,
+                              const int* input_lengths,
+                              const int max_input_length,
+                              const float repetition_penalty) {
+    assert(step > 0);
+
+    const int bbsize = batch_size * beam_width;
+
+    for (int bbid = 0; bbid < bbsize; ++bbid) {
+        int input_length = (input_lengths != NULL) ? input_lengths[bbid] : max_input_length;
+        float penalty_logits[step];
+        int penalty_indices[step];
+
+        float repet_penalty = repetition_penalty;
+        int prev_id = current_ids[bbid];
+        float prev_logit = logits[prev_id];
+        penalty_indices[step - 1] = prev_id;
+
+        // Apply penalty for the current token
+        if (prev_logit > 0) {
+            penalty_logits[step - 1] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit / repet_penalty);
+        } else {
+            penalty_logits[step - 1] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit * repet_penalty);
+        }
+
+        // Process previous steps
+        if (step > 1) {
+            int parent_beam = bbid % beam_width;
+            for (int i = step - 2; i >= 0; --i) {
+                if (i >= input_length && i < max_input_length) {
+                    continue;
+                }
+                parent_beam = parent_ids[i * bbsize + bbid];
+                prev_id = previous_ids[i * bbsize + bbid];
+                prev_logit = logits[prev_id];
+                penalty_indices[i] = prev_id;
+
+                if (prev_logit > 0) {
+                    penalty_logits[i] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit / repet_penalty);
+                } else {
+                    penalty_logits[i] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit * repet_penalty);
+                }
+            }
+        }
+
+        // Update logits
+        for (int i = 0; i < step; ++i) {
+            if (i >= input_length && i < max_input_length) {
+                continue;
+            }
+            logits[penalty_indices[i]] = penalty_logits[i];
+        }
+    }
+}
+
 template<typename T, bool IS_ADDITIVE>
 __global__ void apply_repetition_penalty(T*          logits,
                                          const int   batch_size,
@@ -112,7 +250,7 @@ __global__ void apply_repetition_penalty(T*          logits,
     // prevent misaligment when sizeof(T) = 2
     int*      penalty_indices = reinterpret_cast<int*>(sbuf + (sizeof(T) * step + 31) / 32 * 32);
     const int input_length    = (input_lengths != nullptr) ? input_lengths[bbid] : max_input_length;
-    if (tid == 0) {
+    if (tid == 0) {   // only tid 0
         T   repet_penalty         = static_cast<T>(repetition_penalty);
         int prev_id               = current_ids[bbid];
         T   prev_logit            = logits[prev_id];
@@ -145,6 +283,7 @@ __global__ void apply_repetition_penalty(T*          logits,
         }
     }
     __syncthreads();
+    // 就赋值并行处理一下？ YES
     for (int i = tid; i < step; i += blockDim.x) {
         if (i >= input_length && i < max_input_length) {
             continue;

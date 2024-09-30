@@ -21,6 +21,72 @@
 
 namespace fastertransformer {
 
+// cpu 版本
+void stop_words_criterion(const int* output_ids,
+                           const int* parent_ids,
+                           const int* stop_words,
+                           bool* finished,
+                           size_t id_offset,
+                           size_t stop_words_len,
+                           int batch_size,
+                           int beam_width,
+                           int step) {
+    // 遍历所有的 batch 和 beam
+    for (int batch_idx = 0; batch_idx < batch_size; ++batch_idx) {       // parallel 1
+        for (int beam_idx = 0; beam_idx < beam_width; ++beam_idx) {      // parallel 2
+            // 计算当前 beam 对应的 stop_words 基础指针
+            const int* base_stop_words = stop_words + batch_idx * 2 * stop_words_len;
+            const int* base_offsets = base_stop_words + stop_words_len;
+
+            // 遍历停用词
+            for (int id = 0; id < stop_words_len; ++id) {                // parallel 3
+                if (base_offsets[id] < 0) {
+                    continue;
+                }
+
+                const int item_end = base_offsets[id];
+                const int item_start = (id > 0) ? base_offsets[id - 1] : 0;
+                const int item_size = item_end - item_start;
+
+                // 检查是否有足够的生成令牌来进行匹配
+                bool should_stop = false;
+                if (step + 1 >= item_size) {
+                    should_stop = true;
+                    int parent_id = beam_idx; // 初始化当前 beam 索引
+
+                    // 匹配检查循环
+                    for (int token_idx = item_size - 1; token_idx >= 0; --token_idx) {
+                        const int previous_token = output_ids[(step - (item_size - 1) + token_idx) * batch_size * beam_width
+                                                              + id_offset + batch_idx * beam_width + parent_id];
+
+                        // 检查生成的令牌是否与当前停用词项匹配
+                        if (previous_token != base_stop_words[item_start + token_idx]) {
+                            should_stop = false;
+                            break;
+                        }
+
+                        // 更新 parent_id 为当前令牌的父级 beam 索引
+                        parent_id = parent_ids[(step - (item_size - 1) + token_idx) * beam_width * batch_size + id_offset
+                                               + batch_idx * beam_width + parent_id];
+
+                        if (parent_id < 0 || parent_id >= beam_width) {
+                            should_stop = false;
+                            break;
+                        }
+                    }
+                }
+
+                // 根据匹配结果更新 finished 数组
+                if (should_stop) {
+                    finished[batch_idx * beam_width + beam_idx] = true;
+                }
+            }
+        }
+    }
+}
+
+// base_offsets 存储的是停用词在 stop_words 数组中的偏移量。具体来说，它包含每个停用词项的结束位置，帮助确定每个停用词的范围。
+// stop_words_len 应该是表示停用词 数量 的变量
 __global__ void stop_words_criterion(const int* output_ids,
                                      const int* parent_ids,
                                      const int* stop_words,
@@ -31,6 +97,10 @@ __global__ void stop_words_criterion(const int* output_ids,
                                      int        beam_width,
                                      int        step)
 {
+    // !!!! 并行实现
+    // x => 切分 stop_words_len, 单个线程处理一个 stop_words 的处理
+    // y => 切分 batch 和 beam
+    // => 单个线程处理一个 stop_words 的处理
     const int id        = blockIdx.x * blockDim.x + threadIdx.x;
     const int batch_idx = blockIdx.y / beam_width;
     const int beam_idx  = blockIdx.y % beam_width;
@@ -38,6 +108,7 @@ __global__ void stop_words_criterion(const int* output_ids,
     const int* base_stop_words = stop_words + batch_idx * 2 * stop_words_len;
     const int* base_offsets    = base_stop_words + stop_words_len;
 
+    // ATTENTION stop_words_len
     if (id >= stop_words_len || base_offsets[id] < 0) {
         return;
     }
@@ -50,19 +121,25 @@ __global__ void stop_words_criterion(const int* output_ids,
     bool should_stop = false;
 
     /* Enough previously generated tokens to look for a match */
-    if (step + 1 >= item_size) {
+    if (step + 1 >= item_size) {                                 // step + 1 表示当前生成的令牌数量，item_size 是当前停用词项的大小  => 是否已经生成了足够的令牌来与停用词项进行匹配
         should_stop            = true;
+        // 初始化 parent_id 为当前的 beam 索引，表示当前正在检查的 beam
         int        parent_id   = beam_idx;
+        // 是否需要收集多个 beams 的信息
         const bool gather_beam = beam_width > 1;
 
+        // 匹配检查循环
+        // 最后一个令牌开始向前遍历，检查之前生成的令牌是否与当前停用词项匹配
         for (int token_idx = item_size - 1; token_idx >= 0; token_idx--) {
             const int previous_token = output_ids[(step - (item_size - 1) + token_idx) * batch_size * beam_width
                                                   + id_offset + batch_idx * beam_width + parent_id];
 
+            // previous_token 计算了当前 token_idx 对应的生成令牌
             if (previous_token != base_stop_words[item_start + token_idx]) {
                 should_stop = false;
                 break;
             }
+            // 需要收集多个 beams 的信息，更新 parent_id 为当前令牌的父级 beam 索引
             if (gather_beam) {
                 parent_id = parent_ids[(step - (item_size - 1) + token_idx) * beam_width * batch_size + id_offset
                                        + batch_idx * beam_width + parent_id];
@@ -74,7 +151,7 @@ __global__ void stop_words_criterion(const int* output_ids,
             }
         }
     }
-
+    // 有则是 true
     if (should_stop) {
         finished[batch_idx * beam_width + beam_idx] = true;
     }
@@ -94,6 +171,7 @@ void invokeStopWordsCriterion(const int*   output_ids,
     FT_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     // Check if we have sampled a word from the stop_words list. If so, stop the sequence.
     dim3 block, grid;
+    // x => 是对 stop_words_len 进行切分
     block.x = min(((stop_words_len + 32 - 1) / 32) * 32, 256UL);
     grid.x  = (stop_words_len + block.x - 1) / block.x;
     grid.y  = batch_size * beam_width;
@@ -112,6 +190,7 @@ __global__ void length_criterion(bool*           finished,
                                  int             step)
 {
     int thread_finished_count = 0;
+    // x 一维度 threadIdx.x  blockDim.x
     for (int index = threadIdx.x; index < batch_size * beam_width; index += blockDim.x) {
         const int batch_idx = index / beam_width;
 
@@ -119,6 +198,7 @@ __global__ void length_criterion(bool*           finished,
         thread_finished_count += finished[index] ? 1 : 0;
     }
     int block_finished_count = 0;
+    // 汇总当前块内所有线程完成的序列数
     if (blockDim.x <= 32) {
         block_finished_count = warpReduceSum(thread_finished_count);
     }

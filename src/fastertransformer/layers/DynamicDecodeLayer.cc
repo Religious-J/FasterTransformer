@@ -204,7 +204,7 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
         runtime_top_p
         bad_words_list 不允许生成的词汇列表
         
-        src_cache_indirection beam_search的缓存索引
+        src_cache_indirection beam_search 的缓存索引
 
     OUTPUT：
         output_ids [max_seq_len, batch_size]
@@ -265,7 +265,7 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
     const int step = input_tensors->at("step").getVal<int>();
     FT_CHECK(input_tensors->at("logits").shape.size() == 3);
 
-    // 从 logits 中提取 批量大小， beam 的宽度， 以及局部批量大小
+    // 从 logits 中提取 批量大小, beam 的宽度, 以及局部批量大小
     const size_t batch_size       = input_tensors->at("logits").shape[0];
     const size_t beam_width       = input_tensors->at("logits").shape[1];
     const size_t local_batch_size = (size_t)input_tensors->at("local_batch_size").getVal<int>();
@@ -287,8 +287,8 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
         }
 
         // 确保 维度信息 
-        // 如果 bad_words_list 是 2 维或 3 维矩阵，则进入逻辑处理
-        // 如果是 3 维矩阵，确保第 0 维大小等于 batch_size，否则会抛出错误
+        // 如果 bad_words_list 是 2 维或 3 维矩阵, 则进入逻辑处理
+        // 如果是 3 维矩阵, 确保第 0 维大小等于 batch_size, 否则会抛出错误
         const bool   shared_bad_words = is_matrix || bad_words.shape[0] == 1;
         const size_t bad_words_len    = bad_words.shape[is_matrix ? 1 : 2];
         // Add check on batch size of bad words
@@ -314,9 +314,7 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
     }
 
     // 动态解码（Beam Search）
-
     // cum_log_probs 序列的累积对数概率
-
     // dynamic decode GPT
     if (beam_width > 1) {
         // Because we still not support batch beam search now, so we need to compute one by one if there are different
@@ -408,7 +406,7 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
             FT_CHECK_WITH_INFO(dynamic_decode_output_tensors.isExist("cum_log_probs"),
                                "cum_log_probs should be provided in beam search.");
             // 束搜索执行
-            // beam_hyps 在代码中通常指的是束搜索中的候选序列。存储不同的假设（即序列）及其相关信息，以便在束搜索过程中进行选择和更新。
+            // beam_hyps 在代码中通常指的是束搜索中的候选序列. 存储不同的假设（即序列）及其相关信息, 以便在束搜索过程中进行选择和更新.
             if (true || beam_width < 16
                 || (output_tensors->isExist("beam_hyps")
                     && input_tensors->getVal<float>("beam_search_diversity_rate", 0.0f) != 0.0f)) {
@@ -421,9 +419,9 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
             }
         }  // end of dynamic_ite
     }
-    // 当束宽为1时，代码假设处于采样模式（例如top-k或top-p采样）
+    // 当束宽为1时, 代码假设处于采样模式（例如top-k或top-p采样）
     else {  // beam_width=1
-        // In sampling, we have supported batch sampling. So, we always compute all sentences once.  => 一次处理整个批次，而不是逐个序列处理
+        // In sampling, we have supported batch sampling. So, we always compute all sentences once.  => 一次处理整个批次, 而不是逐个序列处理
         const size_t local_batch_offset = ite * local_batch_size * beam_width;
 
         Tensor logits = input_tensors->at("logits");
@@ -483,7 +481,7 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
     }
 
     // 提供了 stop_words_list（停用词列表）
-    // 调用 invokeStopWordsCriterion 函数，确保不会生成某些标记（停用词）
+    // 调用 invokeStopWordsCriterion 函数, 确保不会生成某些标记（停用词）
     if (input_tensors->isExist("stop_words_list")) {
         const size_t id_offset         = ite * local_batch_size * beam_width;
         const size_t stop_words_length = input_tensors->at("stop_words_list").shape[2];

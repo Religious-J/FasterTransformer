@@ -156,6 +156,11 @@ void ban_bad_words_cpu(float* logits,
 }
 
 
+// same as 
+// bad_words_len 表示有多少个 bad_words
+// base_bad_words_offsets 用于标记 不同 bad_words 的 结束 位置
+// so 每个 bad_words 的实际位置为 base_bad_words_offsets[id] - base_bad_words_offsets[id-1]
+            // 第一个位置特殊：   base_bad_words_offsets[0] - 0
 template<typename T>
 __global__ void ban_bad_words(T*         logits,
                               const int* output_ids_buf,   // 已生成的输出序列的 ID 缓冲区
@@ -185,6 +190,7 @@ __global__ void ban_bad_words(T*         logits,
     const int item_size  = item_end - item_start;
 
     /* The single-token case unconditionally bans the token */
+    // 由于这个词被明确标记为不良词，因此无论之前生成的标记是什么，都应该始终禁止它
     bool should_ban = item_size == 1;
 
     /* Multi-token case and enough previously generated tokens to look for a match */
@@ -213,6 +219,8 @@ __global__ void ban_bad_words(T*         logits,
         }
     }
 
+    // 疑惑： 不会有不同线程的都匹配 bad_words 吗 ???
+    // 应该不会 bad_words 应该没有重叠（本来就只能匹配到一个 
     if (should_ban) {
         int banned_token = base_bad_words[item_end - 1];
         if (0 < banned_token && banned_token < vocab_size_padded) {
