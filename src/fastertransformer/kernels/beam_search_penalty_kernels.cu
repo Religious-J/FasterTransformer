@@ -158,67 +158,126 @@ void apply_repetition_penalty(float* logits,
     }
 }
 
-
-// CPU
-void apply_repetition_penalty_CPU(float* logits,
-                              const int batch_size,
-                              const int beam_width,
-                              const int vocab_size,
-                              const int vocab_size_padded,
-                              const int step,
-                              const int* current_ids,
-                              const int* previous_ids,
-                              const int* parent_ids,
-                              const int* input_lengths,
-                              const int max_input_length,
-                              const float repetition_penalty) {
+// NEW ADD
+template<typename T, bool IS_ADDITIVE>
+void apply_repetition_penalty(T*          logits,
+                              const int   vocab_size,
+                              const int   vocab_size_padded,
+                              const int   step,
+                              const int*  current_ids,       // 当前步正在预测的 token 的 ID 数组
+                              const int*  previous_ids,      // 之前各步生成的 token 的 ID 数组
+                              const int*  parent_ids,
+                              const int*  input_lengths,     // 输入序列的长度数组，帮助跳过填充的 token
+                              const int   max_input_length,
+                              const float repetition_penalty // 重复惩罚系数，用于降低已经生成过的词的概率
+                             )
+{
     assert(step > 0);
 
-    const int bbsize = batch_size * beam_width;
+    T* penalty_logits = (T*)malloc(sizeof(T) * step);
+    int* penalty_indices = (int*)malloc(sizeof(int) * step);
 
-    for (int bbid = 0; bbid < bbsize; ++bbid) {
-        int input_length = (input_lengths != NULL) ? input_lengths[bbid] : max_input_length;
-        float penalty_logits[step];
-        int penalty_indices[step];
+    const int input_length = (input_lengths != nullptr) ? input_lengths[0] : max_input_length;
 
-        float repet_penalty = repetition_penalty;
-        int prev_id = current_ids[bbid];
-        float prev_logit = logits[prev_id];
-        penalty_indices[step - 1] = prev_id;
+    // 获取当前生成的 token ID (prev_id)，然后获取对应的 logit 值 (prev_logit)
+    T   repet_penalty = static_cast<T>(repetition_penalty);
+    int prev_id = current_ids[0];
+    T   prev_logit = logits[prev_id];
+    penalty_indices[step - 1] = prev_id;
 
-        // Apply penalty for the current token
-        if (prev_logit > 0) {
-            penalty_logits[step - 1] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit / repet_penalty);
-        } else {
-            penalty_logits[step - 1] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit * repet_penalty);
-        }
+    // 加法模式：直接从 logit 值中减去重复惩罚
+    if (IS_ADDITIVE) {
+        penalty_logits[step - 1] = prev_logit - repet_penalty;
+    }
+    // 乘法模式：根据 logit 值的正负性，进行相应的乘法或除法操作
+    else {
+        penalty_logits[step - 1] = prev_logit > T(0) ? prev_logit / repet_penalty : prev_logit * repet_penalty;
+    }
 
-        // Process previous steps
-        if (step > 1) {
-            int parent_beam = bbid % beam_width;
-            for (int i = step - 2; i >= 0; --i) {
-                if (i >= input_length && i < max_input_length) {
-                    continue;
-                }
-                parent_beam = parent_ids[i * bbsize + bbid];
-                prev_id = previous_ids[i * bbsize + bbid];
-                prev_logit = logits[prev_id];
-                penalty_indices[i] = prev_id;
-
-                if (prev_logit > 0) {
-                    penalty_logits[i] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit / repet_penalty);
-                } else {
-                    penalty_logits[i] = IS_ADDITIVE ? (prev_logit - repet_penalty) : (prev_logit * repet_penalty);
-                }
-            }
-        }
-
-        // Update logits
-        for (int i = 0; i < step; ++i) {
+    // 处理之前的 steps
+    if (step > 1) {
+        int parent_beam = 0; // since beam_width = 1, parent_beam is always 0
+        for (int i = step - 2; i >= 0; --i) {
+            // Skip the padded tokens
             if (i >= input_length && i < max_input_length) {
                 continue;
             }
-            logits[penalty_indices[i]] = penalty_logits[i];
+            parent_beam = parent_ids[i]; // No need for indexing with batch_id because batch_size = 1
+            prev_id = previous_ids[i];
+            prev_logit = logits[prev_id];
+            penalty_indices[i] = prev_id;
+
+            if (IS_ADDITIVE) {
+                penalty_logits[i] = prev_logit - repet_penalty;
+            } else {
+                penalty_logits[i] = prev_logit > T(0) ? prev_logit / repet_penalty : prev_logit * repet_penalty;
+            }
+        }
+    }
+
+    // 更新 logits
+    for (int i = 0; i < step; ++i) {
+        if (i >= input_length && i < max_input_length) {
+            continue;
+        }
+        logits[penalty_indices[i]] = penalty_logits[i];
+    }
+
+    free(penalty_logits);
+    free(penalty_indices);
+}
+
+template<typename T, bool IS_ADDITIVE>
+void apply_repetition_penalty(T*          logits,
+                              const int   vocab_size,
+                              const int   vocab_size_padded,
+                              const int   step,
+                              const int*  current_ids,       // 当前步正在预测的 token 的 ID 数组
+                              const int*  previous_ids,      // 之前各步生成的 token 的 ID 数组
+                              const int*  parent_ids,
+                              const int*  input_lengths,     // 输入序列的长度数组，帮助跳过填充的 token
+                              const int   max_input_length,
+                              const float repetition_penalty // 重复惩罚系数，用于降低已经生成过的词的概率
+                             )
+{
+    assert(step > 0);
+
+    // 获取当前 beam 对应的输入长度
+    const int input_length = (input_lengths != nullptr) ? input_lengths[0] : max_input_length;
+
+    // 获取当前生成的 token ID (prev_id)，然后获取对应的 logit 值 (prev_logit)
+    T   repet_penalty = static_cast<T>(repetition_penalty);
+    int prev_id = current_ids[0];
+    T   prev_logit = logits[prev_id];
+
+    // 加法模式：直接从 logit 值中减去重复惩罚
+    if (IS_ADDITIVE) {
+        logits[prev_id] = prev_logit - repet_penalty;
+    }
+    // 乘法模式：根据 logit 值的正负性，进行相应的乘法或除法操作
+    else {
+        logits[prev_id] = prev_logit > T(0) ? prev_logit / repet_penalty : prev_logit * repet_penalty;
+    }
+
+    // 处理之前的 steps
+    if (step > 1) {
+        int parent_beam = 0; // since beam_width = 1, parent_beam is always 0
+
+        for (int i = step - 2; i >= 0; --i) {
+            // Skip the padded tokens
+            if (i >= input_length && i < max_input_length) {
+                continue;
+            }
+
+            parent_beam = parent_ids[i]; // No need for indexing with batch_id because batch_size = 1
+            prev_id = previous_ids[i];
+            prev_logit = logits[prev_id];
+
+            if (IS_ADDITIVE) {
+                logits[prev_id] = prev_logit - repet_penalty;
+            } else {
+                logits[prev_id] = prev_logit > T(0) ? prev_logit / repet_penalty : prev_logit * repet_penalty;
+            }
         }
     }
 }
@@ -230,35 +289,42 @@ __global__ void apply_repetition_penalty(T*          logits,
                                          const int   vocab_size,
                                          const int   vocab_size_padded,
                                          const int   step,
-                                         const int*  current_ids,
-                                         const int*  previous_ids,
+                                         const int*  current_ids,       // 当前步正在预测的 token 的 ID 数组
+                                         const int*  previous_ids,      // 之前各步生成的 token 的 ID 数组
                                          const int*  parent_ids,
-                                         const int*  input_lengths,
+                                         const int*  input_lengths,     // 输入序列的长度数组，帮助跳过填充的 token
                                          const int   max_input_length,
-                                         const float repetition_penalty)
+                                         const float repetition_penalty // 重复惩罚系数，用于降低已经生成过的词的概率
+                                         )
 {
     assert(step > 0);
 
     const int tid      = threadIdx.x;
-    const int bbid     = blockIdx.x;
+    const int bbid     = blockIdx.x;      // 每个线程块负责处理一个批次和 beam 组合中的一个序列
     const int batch_id = bbid / beam_width;
     const int bbsize   = batch_size * beam_width;
-
+    // 多个线程可能会对同一个 logits 数组进行并行操作，而 penalty_logits 是共享内存的一部分，保证每个线程执行完毕后，才会一起更新 logits，避免数据冲突
     logits += bbid * vocab_size_padded;
-    extern __shared__ char sbuf[];
+    extern __shared__ char sbuf[];       // sbuf 共享内存，存储临时变量： 惩罚后的logits (penalty_logits) 和对应的token索引 (penalty_indices)
     T*                     penalty_logits = reinterpret_cast<T*>(sbuf);
     // prevent misaligment when sizeof(T) = 2
+    // 32 字节对齐
+    // penalty_indices 指向共享内存中的某个位置
     int*      penalty_indices = reinterpret_cast<int*>(sbuf + (sizeof(T) * step + 31) / 32 * 32);
+    // 获取当前 beam 对应的输入长度
     const int input_length    = (input_lengths != nullptr) ? input_lengths[bbid] : max_input_length;
     if (tid == 0) {   // only tid 0
+        // 获取当前生成的 token ID (prev_id)，然后获取对应的 logit 值 (prev_logit)
         T   repet_penalty         = static_cast<T>(repetition_penalty);
         int prev_id               = current_ids[bbid];
         T   prev_logit            = logits[prev_id];
         penalty_indices[step - 1] = prev_id;
 
+        // 加法模式：直接从 logit 值中减去重复惩罚
         if (IS_ADDITIVE) {
             penalty_logits[step - 1] = prev_logit - repet_penalty;
         }
+        // 乘法模式：根据 logit 值的正负性，进行相应的乘法或除法操作
         else {
             penalty_logits[step - 1] = prev_logit > T(0) ? prev_logit / repet_penalty : prev_logit * repet_penalty;
         }
@@ -283,6 +349,7 @@ __global__ void apply_repetition_penalty(T*          logits,
         }
     }
     __syncthreads();
+    // 并行更新 logits
     // 就赋值并行处理一下？ YES
     for (int i = tid; i < step; i += blockDim.x) {
         if (i >= input_length && i < max_input_length) {
@@ -305,8 +372,12 @@ __global__ void apply_min_length_penalty(T*         logits,
     int bid  = bbid / beam_width;                      // batch index
     // We need +1 because sequence_lengths = max_input_length + num_gen_tokens - 1,
     // which is equal to the length of k/v caches.
+    // So num_gen_tokens = sequence_lengths - max_input_length + 1 
     if (sequence_lengths[bbid] + 1 - max_input_length < min_length) {
         T mask_val                                      = (std::is_same<T, half>::value) ? -HALF_FLT_MAX : -FLT_MAX;
+        //  -> end_ids[bid]
+        // question: why each batch have relevant end_ids ???
+        // 在自然语言处理任务中，不同的句子可能需要不同的结束符
         logits[bbid * vocab_size_padded + end_ids[bid]] = mask_val;
     }
 }

@@ -108,7 +108,7 @@ __global__ void stop_words_criterion(const int* output_ids,
     const int* base_stop_words = stop_words + batch_idx * 2 * stop_words_len;
     const int* base_offsets    = base_stop_words + stop_words_len;
 
-    // ATTENTION stop_words_len
+    // ATTENTION stop_words_len 表示 停用词的个数
     if (id >= stop_words_len || base_offsets[id] < 0) {
         return;
     }
@@ -121,6 +121,8 @@ __global__ void stop_words_criterion(const int* output_ids,
     bool should_stop = false;
 
     /* Enough previously generated tokens to look for a match */
+    // !!! step+1 此处逻辑在 topk 选择完成之后， 此时 sequence 长度为 step+1
+    // step 是在外部大循环内 ++ 更新
     if (step + 1 >= item_size) {                                 // step + 1 表示当前生成的令牌数量，item_size 是当前停用词项的大小  => 是否已经生成了足够的令牌来与停用词项进行匹配
         should_stop            = true;
         // 初始化 parent_id 为当前的 beam 索引，表示当前正在检查的 beam
@@ -190,15 +192,19 @@ __global__ void length_criterion(bool*           finished,
                                  int             step)
 {
     int thread_finished_count = 0;
-    // x 一维度 threadIdx.x  blockDim.x
+    // 对 x 一维度 threadIdx.x  blockDim.x  => batch_size beam_width
     for (int index = threadIdx.x; index < batch_size * beam_width; index += blockDim.x) {
         const int batch_idx = index / beam_width;
-
+        // !!! 位运算 |= 表示 有 true 则为 true
+        // ??? 这里 step不加1 ??  => 因为是 >=
+        // ATTENTION
         finished[index] |= step >= sequence_limit_length[batch_idx];
         thread_finished_count += finished[index] ? 1 : 0;
     }
     int block_finished_count = 0;
     // 汇总当前块内所有线程完成的序列数
+    // 用于 多batch beam_width!=1 的情形
+    // 应该是决定整体计算的是否结束
     if (blockDim.x <= 32) {
         block_finished_count = warpReduceSum(thread_finished_count);
     }

@@ -1291,6 +1291,10 @@ template void invokeTopPSampling(void*           workspace,
                                  cudaDeviceProp* cuda_device_prop,
                                  const bool*     skip_decode);
 
+// end_ids   每个批次的结束索引数组
+// finished  指示每个批次是否完成的数组
+// n_padded  每个批次的元素总数，包括填充
+// n         每个批次的实际元素数，不包括填充
 template<typename T>
 __global__ void
 addBiasSoftMax(T* logits, const T* bias, const int* end_ids, const bool* finished, const int n_padded, const int n)
@@ -1305,34 +1309,44 @@ addBiasSoftMax(T* logits, const T* bias, const int* end_ids, const bool* finishe
     __shared__ float s_max_val;
     __shared__ float s_sum_val;
 
+    // 遍历 n_padded 即 padded 的词表
     for (int tid = threadIdx.x; tid < n_padded; tid += blockDim.x) {
         if (tid < n) {
             if (finish) {
+                // 如果结束了 (finish)，则将 end_ids 对应的 logit 设置为 MAX_T_VAL
+                // 其余的 logit 全设置为 -MAX_T_VAL
+                // 目的：在 softmax 计算后 end_ids 的概率为 1 => 结束
+                // 当前模式要考虑 多batch
                 logits[offset + tid] = (tid == end_ids[bid]) ? MAX_T_VAL : -MAX_T_VAL;
             }
             else {
+                // 添加偏置到 logits
                 T bias_val = (bias != nullptr) ? bias[tid] : (T)0.0f;
                 logits[offset + tid] += bias_val;
             }
         }
+        // 用于 padded 的部分词表 logit 设置为 -MAX_T_VAL， 即不可能选中
         else {
             logits[offset + tid] = -MAX_T_VAL;
         }
         max_val = max(max_val, (float)logits[offset + tid]);
     }
-
+    
+    // 使用 blockReduceMax 在块内（一块对应一个 batch）所有线程中找到最大值，并存储在 s_max_val => __shared__
     max_val = blockReduceMax<float>((float)max_val);
     if (threadIdx.x == 0) {
         s_max_val = max_val;
     }
     __syncthreads();
 
+    // Softmax 指数化和求和:
     float sum_val = 0.0f;
     for (int tid = threadIdx.x; tid < n_padded; tid += blockDim.x) {
         logits[offset + tid] = __expf((float)logits[offset + tid] - s_max_val);
         sum_val += (float)logits[offset + tid];
     }
 
+    // blockReduceSum 求和这些指数
     sum_val = blockReduceSum<float>(sum_val);
     if (threadIdx.x == 0) {
         s_sum_val = sum_val;
@@ -1354,7 +1368,7 @@ void invokeAddBiasSoftMax(T*           logits,
                           const int    n,
                           cudaStream_t stream)
 {
-    dim3 grid(m);
+    dim3 grid(m);        // m local_batch_size
     dim3 block(min(n, 1024));
     /*n is the vocab_size, e.g., 30000, 7000.... vocab_size is usually very big. */
     addBiasSoftMax<<<grid, block, 0, stream>>>(logits, bias, end_ids, finished, n_padded, n);

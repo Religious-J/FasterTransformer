@@ -156,21 +156,16 @@ void ban_bad_words_cpu(float* logits,
 }
 
 
-// same as 
-// bad_words_len 表示有多少个 bad_words
-// base_bad_words_offsets 用于标记 不同 bad_words 的 结束 位置
-// so 每个 bad_words 的实际位置为 base_bad_words_offsets[id] - base_bad_words_offsets[id-1]
-            // 第一个位置特殊：   base_bad_words_offsets[0] - 0
 template<typename T>
 __global__ void ban_bad_words(T*         logits,
-                              const int* output_ids_buf,   // 已生成的输出序列的 ID 缓冲区
-                              const int* parent_ids_buf,   // 束搜索中每个输出 ID 的父 ID 缓冲区
+                              const int* output_ids_buf,    // 已生成的输出序列的 ID 缓冲区
+                              const int* parent_ids_buf,    // 束搜索中每个输出 ID 的父 ID 缓冲区
                               int        batch_size,
                               int        beam_width,
                               const int* bad_words,
                               size_t     bad_words_len,
-                              bool       share_words,      // 指示是否共享不良单词的标志
-                              int        id_offset,        // 定位当前批次的偏移量
+                              bool       share_words,        // 指示是否共享不良单词的标志
+                              int        id_offset,          // 定位当前批次的偏移量
                               int        vocab_size_padded,  // 填充后的词汇表大小
                               size_t     step)
 {
@@ -188,12 +183,17 @@ __global__ void ban_bad_words(T*         logits,
     const int item_end   = base_bad_words_offsets[id];
     const int item_start = (id > 0) ? base_bad_words_offsets[id - 1] : 0;
     const int item_size  = item_end - item_start;
+    // bad_words_len 表示有多少个 bad_words
+    // base_bad_words_offsets 用于标记 不同 bad_words 的 结束 位置
+    // 每个 bad_words 词长度为 base_bad_words_offsets[id] - base_bad_words_offsets[id-1]
+    //     第一个位置特殊计算：   base_bad_words_offsets[0] - 0
 
     /* The single-token case unconditionally bans the token */
-    // 由于这个词被明确标记为不良词，因此无论之前生成的标记是什么，都应该始终禁止它
+    // 由于这个词为一个单词，并被明确标记为不良词，直接禁止它
     bool should_ban = item_size == 1;
 
     /* Multi-token case and enough previously generated tokens to look for a match */
+    // 在 beam_width 为 1 的情况下，将 bad_words_len （bad_words 的个数）进行切分，并行
     if (item_size > 1 && step >= item_size - 1) {
         should_ban             = true;
         int        parent_id   = beam_idx;
