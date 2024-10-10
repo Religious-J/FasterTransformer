@@ -127,6 +127,14 @@ template void invokeAddBiasEndMask(half*        logits,
                                    const int    vocab_size_padded,
                                    cudaStream_t stream);
 
+/*
+PS
+    在经典 Softmax 中，需要通过 e^{z_i}/sum(e^{z}) 显式地除以总和 sum(e^{z})，以确保归一化后的值在 [0, 1] 之间。
+    而在这个 Top-k 采样代码中，没有显式地除以 s_sum 
+    因为在采样时 rand_num 和 s_val2 都是在同一个归一化总和的范围内，整个操作逻辑已经间接地完成了归一化。
+    我们通过逐渐减去概率值直到随机数 rand_num 变为负数时停止，便实现了概率分布下的采样。
+*/
+
 // 从给定的预测概率（log_probs）中选取前 k 个概率最高的值
 // Top-k 搜索：通过 CUB 的 BlockReduce 和 TopK_2，每个 block 对 log_probs 中的词汇表进行并行扫描，找到 top-k 概率最大值及其对应的索引
 // 并将选出的概率值设置为负无穷大，以避免重复选择。
@@ -328,17 +336,12 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,  // 
     }
 }
 
-/*
-PS
-    在经典 Softmax 中，需要通过 e^{z_i}/sum(e^{z}) 显式地除以总和 sum(e^{z})，以确保归一化后的值在 [0, 1] 之间。
-    而在这个 Top-k 采样代码中，没有显式地除以 s_sum 
-    因为在采样时 rand_num 和 s_val2 都是在同一个归一化总和的范围内，整个操作逻辑已经间接地完成了归一化。
-    我们通过逐渐减去概率值直到随机数 rand_num 变为负数时停止，便实现了概率分布下的采样。
-*/
+
 
 
 // CASE_K(1, 16, 128, 128, 8);
 // CASE_K(17, 32, 256, 128, 8);
+// topk_stage1 block内局部 topk ; topk_stage2_sampling 整体
 #define CASE_K(K_MIN, K_MAX, BLOCK_SIZE_1_, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_)                                           \
     case K_MIN ... K_MAX:                                                                                              \
         topk_stage1<T, BLOCK_SIZE_1_, BLOCKS_PER_BEAM_>                                                                \
