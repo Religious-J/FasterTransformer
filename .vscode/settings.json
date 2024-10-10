@@ -71,6 +71,18 @@
         "cfenv": "cpp",
         "typeindex": "cpp",
         "span": "cpp",
-        "any": "cpp"
+        "any": "cpp",
+        "text_encoding": "cpp",
+        "bit": "cpp",
+        "charconv": "cpp",
+        "codecvt": "cpp",
+        "compare": "cpp",
+        "concepts": "cpp",
+        "format": "cpp",
+        "numbers": "cpp",
+        "semaphore": "cpp",
+        "stop_token": "cpp",
+        "valarray": "cpp",
+        "variant": "cpp"
     }
 }

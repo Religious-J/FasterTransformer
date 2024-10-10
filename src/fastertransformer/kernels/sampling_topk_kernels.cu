@@ -127,6 +127,9 @@ template void invokeAddBiasEndMask(half*        logits,
                                    const int    vocab_size_padded,
                                    cudaStream_t stream);
 
+// 从给定的预测概率（log_probs）中选取前 k 个概率最高的值
+// Top-k 搜索：通过 CUB 的 BlockReduce 和 TopK_2，每个 block 对 log_probs 中的词汇表进行并行扫描，找到 top-k 概率最大值及其对应的索引
+// 并将选出的概率值设置为负无穷大，以避免重复选择。
 template<typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
 __global__ void topk_stage1(const T* __restrict log_probs,
                             T*          tmp_log_probs,
@@ -149,7 +152,9 @@ __global__ void topk_stage1(const T* __restrict log_probs,
     if (skip_decode != nullptr && skip_decode[batch_id]) {
         return;
     }
+    // 当前块在当前 beam 中的索引
     const int block_lane = bid % BLOCKS_PER_BEAM_;                              // block id for a beam
+    // top-k 的值
     const int k          = (top_ks != nullptr) ? top_ks[batch_id] : max_top_k;  // batch_id = batch index
 
     const int tmp_log_buf_index  = batch_id * vocab_size;
@@ -159,6 +164,7 @@ __global__ void topk_stage1(const T* __restrict log_probs,
     const bool IS_FP16   = std::is_same<T, half>::value;
     const T    MAX_T_VAL = (IS_FP16) ? HALF_FLT_MAX : FLT_MAX;
 
+    // 如果该 batch 已经完成（比如已经生成结束符），直接处理结束符
     if (finished != nullptr && finished[batch_id] == true) {
         if (tid < k) {
             const int index = tmp_topk_buf_index + tid;
@@ -174,15 +180,16 @@ __global__ void topk_stage1(const T* __restrict log_probs,
         }
         return;
     }
-
+    // 将 log_probs 拷贝到 tmp_log_probs 缓存中
     for (int elem_id = tid + block_lane * BLOCK_SIZE_; elem_id < vocab_size;
          elem_id += BLOCK_SIZE_ * BLOCKS_PER_BEAM_) {
         int index            = elem_id + tmp_log_buf_index;
         tmp_log_probs[index] = log_probs[index];
     }
 
+    // 开始选择 top-k
     for (int ite = 0; ite < k; ite++) {
-        partial.init();
+        partial.init();  // 初始化 partial 变量用于存储当前线程的 top-k 值
 #pragma unroll
         for (int elem_id = tid + block_lane * BLOCK_SIZE_; elem_id < vocab_size;
              elem_id += BLOCK_SIZE_ * BLOCKS_PER_BEAM_) {
@@ -190,31 +197,34 @@ __global__ void topk_stage1(const T* __restrict log_probs,
             partial.insert(tmp_log_probs[index], index);
         }
 
+        // 通过 BlockReduce 在 block 内部进行 reduce 操作，找到 top-k 值
         TopK_2<T> total = BlockReduce(temp_storage).Reduce(partial, reduce_topk_op_2<T>);
 
+        // 线程 0 记录 top-k 结果
         if (tid == 0) {
             const int index         = tmp_topk_buf_index + ite;
-            topk_tmp_id_buf[index]  = total.p;
-            topk_tmp_val_buf[index] = total.u;
-            tmp_log_probs[total.p]  = -MAX_T_VAL;
+            topk_tmp_id_buf[index]  = total.p;      // 保存当前 top-k 的索引
+            topk_tmp_val_buf[index] = total.u;      // 保存当前 top-k 的 log 概率值
+            tmp_log_probs[total.p]  = -MAX_T_VAL;   // 将已经选过的值设为负无穷，以避免下次再选到
         }
         __syncthreads();
     }
 }
 
+// 执行 Top-k 采样的第二阶段。它从第一阶段选出的 Top-k 候选项中根据概率分布进行采样。
 template<typename T, int BLOCK_SIZE_, int BLOCKS_PER_BEAM_>
-__global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
-                                     T*             topk_tmp_val_buf,
+__global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,  // 第一阶段中的临时缓冲区，保存 Top-k 的候选索引
+                                     T*             topk_tmp_val_buf,        // 第一阶段中的临时缓冲区，保存 Top-k 的候选概率值
                                      int*           ids,
                                      int*           sequence_length,
                                      bool*          finished,
                                      float*         cum_log_probs,
                                      float*         output_log_probs,
                                      const int      max_top_k,
-                                     const int*     top_ks,
-                                     const float    top_p,
+                                     const int*     top_ks,                 // 每个批次的具体 Top-k 值，如果没有指定，使用 max_top_k
+                                     const float    top_p,                  // 每个批次的具体 top_p 阈值
                                      const float*   top_ps,
-                                     curandState_t* curandstate,
+                                     curandState_t* curandstate,            // CUDA 随机数生成器状态，用于生成随机数
                                      const int*     end_ids,
                                      const int      vocab_size,
                                      const bool*    skip_decode)
@@ -232,7 +242,7 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
     const float prob_threshold = (top_ps != nullptr) ? top_ps[batch_id] : top_p;
     const int   size           = k * BLOCKS_PER_BEAM_;
     const int   stride         = max_top_k * BLOCKS_PER_BEAM_;
-
+    // 初始化共享变量
     typedef cub::BlockReduce<TopK_2<float>, BLOCK_SIZE_> BlockReduce;
     __shared__ typename BlockReduce::TempStorage         temp_storage;
     extern __shared__ char                               array[];
@@ -246,11 +256,13 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
     }
     TopK_2<float> partial;
 
+    // 处理已经完成的序列：
     if (finished != nullptr && finished[batch_id] == true) {
         ids[batch_id] = end_ids[batch_id];
         return;
     }
 
+    // 通过 softmax 处理 logits：
     float* s_val2 = reinterpret_cast<float*>(s_id + k);
     for (int ite = 0; ite < k; ite++) {
         partial.init();
@@ -278,13 +290,17 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
         }
         __syncthreads();
     }
-
+    // 采样过程：
     if (tid == 0) {
+        // 生成一个随机数 rand_num，用于在 softmax 归一化的概率分布中进行采样
         rand_num = (float)curand_uniform(curandstate + blockIdx.x) * prob_threshold * s_sum;
+        // 从 Top-k 的候选项中依次减去 rand_num，直到 rand_num 变为负值或遍历完候选集，从而选择对应的候选项
         for (int i = 0; i < k; i++) {
             float exp_logit = s_val2[i];
             rand_num        = rand_num - exp_logit;
             if (rand_num <= 0.0f || i == k - 1) {
+                // 如果 cum_log_probs 或 output_log_probs 被提供，函数会计算所选 token 的 log 概率，并更新累积 log 概率或输出 log 概率。
+                // output_log_probs 保存的是所选 token 相对于整个 Top-k 集的概率，即 log P(i | i is in top-k)
                 ids[batch_id] = topk_tmp_id_buf[batch_id * stride + s_id[i]] % vocab_size;
                 if (cum_log_probs != nullptr || output_log_probs != nullptr) {
                     float log_prob = logf(exp_logit);
@@ -304,6 +320,7 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
                 break;
             }
         }
+        // 更新序列状态
         if (sequence_length != nullptr && finished != nullptr) {
             sequence_length[batch_id] = finished[batch_id] ? sequence_length[batch_id] : sequence_length[batch_id] + 1;
             finished[batch_id]        = ids[batch_id] == end_ids[batch_id] ? true : false;
@@ -311,6 +328,17 @@ __global__ void topk_stage2_sampling(const int* __restrict topk_tmp_id_buf,
     }
 }
 
+/*
+PS
+    在经典 Softmax 中，需要通过 e^{z_i}/sum(e^{z}) 显式地除以总和 sum(e^{z})，以确保归一化后的值在 [0, 1] 之间。
+    而在这个 Top-k 采样代码中，没有显式地除以 s_sum 
+    因为在采样时 rand_num 和 s_val2 都是在同一个归一化总和的范围内，整个操作逻辑已经间接地完成了归一化。
+    我们通过逐渐减去概率值直到随机数 rand_num 变为负数时停止，便实现了概率分布下的采样。
+*/
+
+
+// CASE_K(1, 16, 128, 128, 8);
+// CASE_K(17, 32, 256, 128, 8);
 #define CASE_K(K_MIN, K_MAX, BLOCK_SIZE_1_, BLOCK_SIZE_2_, BLOCKS_PER_BEAM_)                                           \
     case K_MIN ... K_MAX:                                                                                              \
         topk_stage1<T, BLOCK_SIZE_1_, BLOCKS_PER_BEAM_>                                                                \
@@ -386,7 +414,7 @@ void invokeBatchTopKSampling(void*          workspace,
     T*   topk_tmp_val_buf = (T*)(topk_tmp_id_buf + topk_tmp_ids_buf_size);
 
     switch (max_top_k) {
-        CASE_K(1, 16, 128, 128, 8);
+        CASE_K(1, 16, 128, 128, 8);    // 含义表示 k 1~16 时走这个分支
         CASE_K(17, 32, 256, 128, 8);
         CASE_K(33, 64, 256, 256, 8);
         CASE_K(65, 1024, 256, 256, 8);

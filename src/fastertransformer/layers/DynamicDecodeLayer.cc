@@ -212,6 +212,8 @@ void DynamicDecodeLayer<T>::forward(TensorMap* output_tensors, TensorMap* input_
         cum_log_probs: 累积的对数概率，用于 Beam Search
         parent_ids: 在 beam_search 中跟踪每个输出来源的索引
         sequence_length： 保存每个序列的生成长度
+
+        如果整个 batch_size 是 64，但一次只能处理 16 个样本，那么 ite = 0 时处理第 1 到 16 个样本，ite = 1 时处理第 17 到 32 个样本，依此类推
     */
     
     /**

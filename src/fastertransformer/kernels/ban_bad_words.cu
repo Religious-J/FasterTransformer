@@ -183,7 +183,7 @@ __global__ void ban_bad_words(T*         logits,
     const int item_end   = base_bad_words_offsets[id];
     const int item_start = (id > 0) ? base_bad_words_offsets[id - 1] : 0;
     const int item_size  = item_end - item_start;
-    // bad_words_len 表示有多少个 bad_words
+    // bad_words_len 表示 bad_words 的总长度!!!
     // base_bad_words_offsets 用于标记 不同 bad_words 的 结束 位置
     // 每个 bad_words 词长度为 base_bad_words_offsets[id] - base_bad_words_offsets[id-1]
     //     第一个位置特殊计算：   base_bad_words_offsets[0] - 0

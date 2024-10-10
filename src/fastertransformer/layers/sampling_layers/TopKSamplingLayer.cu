@@ -185,6 +185,7 @@ void TopKSamplingLayer<T>::setup(const size_t batch_size, const size_t beam_widt
     delete[] runtime_top_ks;
 }
 
+// AAAAAA IMPORTANT
 template<typename T>
 void TopKSamplingLayer<T>::runSampling(TensorMap* output_tensors, TensorMap* input_tensors)
 {
@@ -201,9 +202,9 @@ void TopKSamplingLayer<T>::runSampling(TensorMap* output_tensors, TensorMap* inp
     //      finished [local_batch_size], optional
     //      sequence_length [local_batch_size], optional
     //      cum_log_probs [batch_size], must be float*, optional
-    //          The cumultative log probability of generated tokens.
+    //          The cumultative log probability of generated tokens.       生成的 Token 的累积对数概率
     //      output_log_probs [local_batch_size], must be float*, optional
-    //          The log probs at the current step.
+    //          The log probs at the current step.                         在当前步骤中执行的 log probs
 
     FT_LOG_DEBUG(__PRETTY_FUNCTION__);
     FT_CHECK(input_tensors->size() >= 4);
@@ -233,7 +234,7 @@ void TopKSamplingLayer<T>::runSampling(TensorMap* output_tensors, TensorMap* inp
         output_tensors->isExist("output_log_probs") ? output_tensors->at("output_log_probs").getPtr<float>() : nullptr;
 
     if (cum_log_probs != nullptr || output_log_probs != nullptr) {
-        invokeAddBiasSoftMax(
+        invokeAddBiasSoftMax(                           // 和 invokeAddBiasEndMask 有点计算重叠
             logits,
             (T*)(nullptr),
             input_tensors->at("end_id").getPtr<int>(),
